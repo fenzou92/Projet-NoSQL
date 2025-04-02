@@ -1,86 +1,111 @@
 from pymongo import MongoClient
 from neo4j import GraphDatabase
+import re
 
-# CONFIG - à adapter selon ton environnement
-MONGO_URI = "mongodb://127.0.0.1:27017/"
+# === Configuration MongoDB ===
+MONGO_URI = "mongodb+srv://feno:u1hcslgM3AkFGOru@cluster0.l1dryix.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 DB_NAME = "entertainment"
 COLLECTION_NAME = "films"
 
-NEO4J_URI = "bolt://52.205.250.203:7687"  # ou "neo4j+s://xxx.bolt.neo4jsandbox.com:443"
+# === Configuration Neo4j ===
+NEO4J_URI = "bolt://54.210.151.222:7687"
 NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "sign-talks-recombinations"
+NEO4J_PASSWORD = "notice-rates-definitions"
 
-# Membres du projet à rattacher à un film
 PROJECT_MEMBERS = ["Fenosoa", "Coéquipier1", "Coéquipier2", "Mariam"]
-MOVIE_FOR_MEMBERS = "Inception"  # Nom du film auquel on les rattache
+MOVIE_FOR_MEMBERS = "Inception"
+
+def normalize_genres(raw_genres):
+    """Gestion spécifique pour les chaînes séparées par des virgules"""
+    if isinstance(raw_genres, str):
+        genres = [g.strip().title() for g in re.split(r',\s*', raw_genres)]
+    elif isinstance(raw_genres, list):
+        genres = [str(g).strip().title() for g in raw_genres]
+    else:
+        genres = ["Inconnu"]
+    return list({g for g in genres if g} or {"Inconnu"})
 
 def import_data():
-    # --- Connexion MongoDB ---
     mongo_client = MongoClient(MONGO_URI)
     db = mongo_client[DB_NAME]
     films_collection = db[COLLECTION_NAME]
 
-    # --- Connexion Neo4j ---
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
     with driver.session() as session:
-        # 1) (Optionnel) Vider la base Neo4j pour repartir de zéro
         session.run("MATCH (n) DETACH DELETE n")
         print("Base Neo4j réinitialisée.")
 
-        # 2) Parcourir les films dans MongoDB et créer les nœuds
+        batch = []
         for film in films_collection.find():
-            # Récupérer les champs
-            film_id = str(film.get("_id", ""))       # _id du film
-            title = film.get("title", "Unknown")    
-            year = film.get("year", None)
-            votes = film.get("Votes", 0)
-            revenue = film.get("Revenue (Millions)", 0)
-            rating = film.get("rating", "Unknown")
-            director = film.get("Director", "Unknown")
-            
-            # Certains champs comme Actors sont une liste ou une string "A, B, C"
-            actors_str = film.get("Actors", "")
-            actors_list = actors_str.split(", ") if actors_str else []
+            # Gestion de la conversion du revenue
+            rev_raw = film.get("Revenue (Millions)", 0)
+            if isinstance(rev_raw, str):
+                if rev_raw.strip() == "":
+                    rev = 0.0
+                else:
+                    rev = float(rev_raw.replace("$", ""))
+            else:
+                rev = float(rev_raw)
+                
+            film_data = {
+                "film_id": str(film["_id"]),
+                "title": film.get("title", "Sans titre").strip(),
+                "director": film.get("Director", "Inconnu").strip().title(),
+                "actors": [a.strip().title() for a in film.get("Actors", "").split(", ") if a],
+                "genres": normalize_genres(film.get("genre", "")),
+                "year": film.get("year", 0),
+                "rating": film.get("rating", "NC").upper(),
+                "votes": int(film.get("Votes", 0)) if str(film.get("Votes", 0)).isdigit() else 0,
+                "revenue": rev
+            }
+            batch.append(film_data)
 
-            # --- Créer le nœud Film ---
-            session.run("""
-                MERGE (f:Film {id: $film_id})
-                SET f.title = $title,
-                    f.year = $year,
-                    f.votes = $votes,
-                    f.revenue = $revenue,
-                    f.rating = $rating,
-                    f.director = $director
-            """, film_id=film_id, title=title, year=year, votes=votes, 
-                 revenue=revenue, rating=rating, director=director)
+            if len(batch) >= 50:
+                process_batch(session, batch)
+                batch = []
 
-            # --- Créer le nœud Realisateur et la relation :REALISE ---
-            session.run("""
-                MERGE (r:Realisateur {name: $director})
-                MERGE (f:Film {id: $film_id})
-                MERGE (r)-[:REALISE]->(f)
-            """, director=director, film_id=film_id)
+        if batch:
+            process_batch(session, batch)
 
-            # --- Créer les nœuds Actor + relation :A_JOUE ---
-            for actor_name in actors_list:
-                session.run("""
-                    MERGE (a:Actor {name: $actor_name})
-                    MERGE (f:Film {id: $film_id})
-                    MERGE (a)-[:A_JOUE]->(f)
-                """, actor_name=actor_name, film_id=film_id)
-
-        # 3) Ajouter les membres du projet comme acteurs d'un film précis
-        for member in PROJECT_MEMBERS:
-            session.run("""
-                MERGE (a:Actor {name: $member})
-                MERGE (f:Film {title: $movie_title})
-                MERGE (a)-[:A_JOUE]->(f)
-            """, member=member, movie_title=MOVIE_FOR_MEMBERS)
+        # Ajout des membres du projet
+        session.run("""
+            UNWIND $members AS member
+            MERGE (a:Actor {name: member})
+            MERGE (f:Film {title: $title})
+            MERGE (a)-[:A_JOUE]->(f)
+        """, members=PROJECT_MEMBERS, title=MOVIE_FOR_MEMBERS)
 
     driver.close()
     mongo_client.close()
-    print("✅ Importation terminée !")
+    print("✅ Importation réussie avec données financières !")
+
+def process_batch(session, batch):
+    """Requête Cypher avec propriétés financières"""
+    query = """
+    UNWIND $batch AS movie
+    MERGE (f:Film {id: movie.film_id})
+    SET f.title = movie.title,
+        f.year = movie.year,
+        f.rating = movie.rating,
+        f.votes = movie.votes,
+        f.revenue = movie.revenue
+        
+    WITH movie, f
+    MERGE (r:Realisateur {name: movie.director})
+    MERGE (r)-[:REALISE]->(f)
+    
+    WITH movie, f
+    UNWIND movie.actors AS actor
+    MERGE (a:Actor {name: actor})
+    MERGE (a)-[:A_JOUE]->(f)
+    
+    WITH movie, f
+    UNWIND movie.genres AS genre
+    MERGE (g:Genre {name: genre})
+    MERGE (f)-[:A_POUR_GENRE]->(g)
+    """
+    session.run(query, batch=batch)
 
 if __name__ == "__main__":
     import_data()
